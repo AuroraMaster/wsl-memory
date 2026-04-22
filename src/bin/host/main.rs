@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use wsl_memory_agent::{
     diagnose_port_conflicts, ElasticReclaimer, PortManager, PressureLevel, ReclamationAction,
@@ -100,6 +102,13 @@ struct ConnectionState {
     distro_name: String,
 }
 
+#[derive(Clone)]
+struct HostRuntimeConfig {
+    token: Option<String>,
+}
+
+const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Platform-specific helpers
 // ---------------------------------------------------------------------------
@@ -183,6 +192,37 @@ fn validate_token(val: &serde_json::Value, expected: &Option<String>) -> bool {
     } else {
         true
     }
+}
+
+fn load_runtime_config(base: &config::HostConfig) -> HostRuntimeConfig {
+    let cfg = config::load().unwrap_or_else(|| base.clone());
+    let token = std::fs::read_to_string(&cfg.token_path)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    HostRuntimeConfig { token }
+}
+
+fn current_runtime(runtime: &Arc<RwLock<HostRuntimeConfig>>) -> HostRuntimeConfig {
+    runtime
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or(HostRuntimeConfig { token: None })
+}
+
+fn spawn_config_reloader(base: config::HostConfig) -> Arc<RwLock<HostRuntimeConfig>> {
+    let runtime = Arc::new(RwLock::new(load_runtime_config(&base)));
+    let shared = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        loop {
+            sleep(CONFIG_REFRESH_INTERVAL).await;
+            let next = load_runtime_config(&base);
+            if let Ok(mut guard) = shared.write() {
+                *guard = next;
+            }
+        }
+    });
+    runtime
 }
 
 async fn send_command_tcp(stream: &mut TcpStream, cmd: &CommandMsg) -> bool {
@@ -271,7 +311,7 @@ fn build_action_command(
 
 async fn handle_connection_elastic(
     mut stream: TcpStream,
-    token: Option<String>,
+    runtime: Arc<RwLock<HostRuntimeConfig>>,
     reclaim_config: ReclamationConfig,
 ) {
     let peer = stream.peer_addr().ok();
@@ -315,6 +355,7 @@ async fn handle_connection_elastic(
 
         match val.get("msg_type").and_then(|v| v.as_str()) {
             Some("metrics") => {
+                let token = current_runtime(&runtime).token;
                 if !validate_token(&val, &token) {
                     let _ = stream.shutdown().await;
                     return;
@@ -395,7 +436,10 @@ struct UdpGuestState {
 // UDP server loop
 // ---------------------------------------------------------------------------
 
-async fn run_udp_server(listen_addr: &str, token: Option<String>) -> anyhow::Result<()> {
+async fn run_udp_server(
+    listen_addr: &str,
+    runtime: Arc<RwLock<HostRuntimeConfig>>,
+) -> anyhow::Result<()> {
     let sock = UdpSocket::bind(listen_addr).await?;
     info!("UDP server listening on {}", listen_addr);
 
@@ -440,6 +484,7 @@ async fn run_udp_server(listen_addr: &str, token: Option<String>) -> anyhow::Res
             _ => continue,
         }
 
+        let token = current_runtime(&runtime).token;
         if !validate_token(&val, &token) {
             continue;
         }
@@ -477,12 +522,12 @@ async fn run_udp_server(listen_addr: &str, token: Option<String>) -> anyhow::Res
 
 pub async fn run_server(cfg: &config::HostConfig, use_tcp: bool) -> anyhow::Result<()> {
     let listen_addr = &cfg.listen_addr;
+    let runtime = spawn_config_reloader(cfg.clone());
 
-    let token = std::fs::read_to_string(&cfg.token_path)
-        .ok()
-        .map(|t| t.trim().to_string());
-
-    info!("token configured: {}", token.is_some());
+    info!(
+        "token configured: {}",
+        current_runtime(&runtime).token.is_some()
+    );
     info!("protocol: {}", if use_tcp { "TCP" } else { "UDP" });
 
     if use_tcp {
@@ -493,13 +538,13 @@ pub async fn run_server(cfg: &config::HostConfig, use_tcp: bool) -> anyhow::Resu
 
         loop {
             let (stream, _) = listener.accept().await?;
-            let token = token.clone();
+            let runtime = Arc::clone(&runtime);
 
             let rc = reclaim_config.clone();
-            tokio::spawn(handle_connection_elastic(stream, token, rc));
+            tokio::spawn(handle_connection_elastic(stream, runtime, rc));
         }
     } else {
-        run_udp_server(listen_addr, token).await
+        run_udp_server(listen_addr, runtime).await
     }
 }
 

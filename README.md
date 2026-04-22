@@ -57,6 +57,15 @@ multi_path: true
 tcp: false
 ```
 
+Both agents reload runtime-safe config every 5 seconds:
+
+- Windows host: `token_path` and token file content
+- WSL guest: `token_path`, `interval`, and `allow_drop`
+
+Network-shaping fields (`listen_addr`, `host`, `multi_path`, `tcp`) require a
+service restart or reconnect because they affect bound sockets and target
+selection.
+
 `allow_drop` is disabled by default. The guest prefers cgroup v2
 `memory.reclaim`; `drop_caches` is only used when explicitly enabled and when
 the agent sees critical idle pressure.

@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -25,7 +25,7 @@ const INSTALL_PATH: &str = "/usr/local/bin/wsl-memory-guest";
 const SERVICE_FILE: &str = "/etc/systemd/system/wsl-memory-guest.service";
 const CONFIG_FILE: &str = "/usr/local/etc/wsl-memory-agent/config.yaml";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(about = "WSL Memory Guest Agent — collect metrics and execute reclamation")]
 struct Opt {
     /// YAML config file in the WSL install prefix.
@@ -74,6 +74,15 @@ struct Opt {
     #[arg(long, action = ArgAction::SetTrue)]
     udp: bool,
 }
+
+#[derive(Clone)]
+struct GuestRuntimeConfig {
+    token: String,
+    interval: u64,
+    allow_drop: bool,
+}
+
+const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -136,6 +145,55 @@ impl GuestConfig {
         }
         self
     }
+}
+
+fn load_runtime_config(config_path: &Path, opt: &Opt) -> anyhow::Result<GuestRuntimeConfig> {
+    let cfg = GuestConfig::load(config_path)?.merged_with_cli(opt);
+    let token = fs::read_to_string(&cfg.token_path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| anyhow::anyhow!("failed read token at {:?}: {}", cfg.token_path, e))?;
+    if token.is_empty() {
+        anyhow::bail!("token at {:?} is empty", cfg.token_path);
+    }
+    Ok(GuestRuntimeConfig {
+        token,
+        interval: cfg.interval.max(1),
+        allow_drop: cfg.allow_drop,
+    })
+}
+
+fn current_runtime(runtime: &Arc<RwLock<GuestRuntimeConfig>>) -> GuestRuntimeConfig {
+    runtime
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| GuestRuntimeConfig {
+            token: String::new(),
+            interval: 4,
+            allow_drop: false,
+        })
+}
+
+fn spawn_config_reloader(
+    config_path: PathBuf,
+    opt: Opt,
+    initial: GuestRuntimeConfig,
+) -> Arc<RwLock<GuestRuntimeConfig>> {
+    let runtime = Arc::new(RwLock::new(initial));
+    let shared = Arc::clone(&runtime);
+    tokio::spawn(async move {
+        loop {
+            sleep(CONFIG_REFRESH_INTERVAL).await;
+            match load_runtime_config(&config_path, &opt) {
+                Ok(next) => {
+                    if let Ok(mut guard) = shared.write() {
+                        *guard = next;
+                    }
+                }
+                Err(e) => warn!("failed reload config: {}", e),
+            }
+        }
+    });
+    runtime
 }
 
 #[cfg(unix)]
@@ -759,9 +817,7 @@ fn collect_metrics(
 
 async fn run_tcp_loop(
     mut stream: TcpStream,
-    token: &str,
-    interval: u64,
-    allow_drop: bool,
+    runtime: Arc<RwLock<GuestRuntimeConfig>>,
     host_last_cmd: Arc<Mutex<Option<Instant>>>,
     host_connected: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -772,7 +828,8 @@ async fn run_tcp_loop(
     let mut command_cache = CommandCache::new();
     let result = async {
         loop {
-            let out = collect_metrics(token, &mut cpu, &mut io)?;
+            let rt = current_runtime(&runtime);
+            let out = collect_metrics(&rt.token, &mut cpu, &mut io)?;
             stream.write_all(&out).await?;
 
             match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
@@ -780,7 +837,7 @@ async fn run_tcp_loop(
                 Ok(Ok(n)) if n > 0 => {
                     if let Ok(cmd) = serde_json::from_slice::<CommandMsg>(&buf[..n]) {
                         if let Some(response) =
-                            handle_command_cached(&cmd, allow_drop, &mut command_cache).await
+                            handle_command_cached(&cmd, rt.allow_drop, &mut command_cache).await
                         {
                             let _ = stream.write_all(&response).await;
                         }
@@ -792,7 +849,7 @@ async fn run_tcp_loop(
                 _ => {}
             }
 
-            sleep(Duration::from_secs(interval)).await;
+            sleep(Duration::from_secs(rt.interval)).await;
         }
     }
     .await;
@@ -806,9 +863,7 @@ async fn run_tcp_loop(
 
 async fn run_udp_loop(
     host_addr: std::net::SocketAddr,
-    token: &str,
-    interval: u64,
-    allow_drop: bool,
+    runtime: Arc<RwLock<GuestRuntimeConfig>>,
     host_last_cmd: Arc<Mutex<Option<Instant>>>,
     host_connected: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -823,14 +878,15 @@ async fn run_udp_loop(
 
     let result: anyhow::Result<()> = async {
         loop {
-            let out = collect_metrics(token, &mut cpu, &mut io)?;
+            let rt = current_runtime(&runtime);
+            let out = collect_metrics(&rt.token, &mut cpu, &mut io)?;
             sock.send(&out).await?;
 
             match tokio::time::timeout(Duration::from_secs(1), sock.recv(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
                     if let Ok(cmd) = serde_json::from_slice::<CommandMsg>(&buf[..n]) {
                         if let Some(response) =
-                            handle_command_cached(&cmd, allow_drop, &mut command_cache).await
+                            handle_command_cached(&cmd, rt.allow_drop, &mut command_cache).await
                         {
                             let _ = sock.send(&response).await;
                         }
@@ -842,7 +898,7 @@ async fn run_udp_loop(
                 _ => {}
             }
 
-            sleep(Duration::from_secs(interval)).await;
+            sleep(Duration::from_secs(rt.interval)).await;
         }
     }
     .await;
@@ -972,16 +1028,16 @@ async fn main() -> anyhow::Result<()> {
     let cfg = GuestConfig::load(&opt.config)?.merged_with_cli(&opt);
     info!("loaded guest config from {}", opt.config.display());
 
-    let token = fs::read_to_string(&cfg.token_path)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| {
-            error!("failed read token at {:?}", cfg.token_path);
-            std::process::exit(1);
-        });
+    let runtime_initial = load_runtime_config(&opt.config, &opt).unwrap_or_else(|e| {
+        error!("{}", e);
+        std::process::exit(1);
+    });
 
-    if cfg.allow_drop {
+    if runtime_initial.allow_drop {
         warn!("drop_caches is ENABLED (may impact performance)");
     }
+
+    let runtime = spawn_config_reloader(opt.config.clone(), opt.clone(), runtime_initial);
 
     // Shared state between host-connection loop and local reclaim loop.
     let host_last_cmd: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
@@ -1029,9 +1085,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                         if let Err(e) = run_tcp_loop(
                             stream,
-                            &token,
-                            cfg.interval,
-                            cfg.allow_drop,
+                            Arc::clone(&runtime),
                             Arc::clone(&host_last_cmd),
                             Arc::clone(&host_connected),
                         )
@@ -1054,9 +1108,7 @@ async fn main() -> anyhow::Result<()> {
                         info!("TCP connected to {}", host_addr);
                         if let Err(e) = run_tcp_loop(
                             stream,
-                            &token,
-                            cfg.interval,
-                            cfg.allow_drop,
+                            Arc::clone(&runtime),
                             Arc::clone(&host_last_cmd),
                             Arc::clone(&host_connected),
                         )
@@ -1094,9 +1146,7 @@ async fn main() -> anyhow::Result<()> {
                         info!("UDP target reachable: {}", target_addr);
                         if let Err(e) = run_udp_loop(
                             target_addr,
-                            &token,
-                            cfg.interval,
-                            cfg.allow_drop,
+                            Arc::clone(&runtime),
                             Arc::clone(&host_last_cmd),
                             Arc::clone(&host_connected),
                         )
@@ -1116,9 +1166,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 if let Err(e) = run_udp_loop(
                     addr,
-                    &token,
-                    cfg.interval,
-                    cfg.allow_drop,
+                    Arc::clone(&runtime),
                     Arc::clone(&host_last_cmd),
                     Arc::clone(&host_connected),
                 )

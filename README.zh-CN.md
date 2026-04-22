@@ -69,6 +69,15 @@ multi_path: true
 tcp: false
 ```
 
+两端会每 5 秒重新读取一次运行中可安全更新的配置：
+
+- Windows host：`token_path` 和 token 文件内容
+- WSL guest：`token_path`、`interval`、`allow_drop`
+
+网络连接类字段需要重启服务或等待重连后生效，包括 `listen_addr`、`host`、
+`multi_path`、`tcp`。这些字段会影响监听 socket 或连接目标，不能在已有连接上
+无缝切换。
+
 `allow_drop` 默认是 `false`。常规回收走 `/sys/fs/cgroup/memory.reclaim`。
 只有你显式启用 `allow_drop`，并且系统处于临界压力且空闲时，guest 才会尝试
 `drop_caches`。
