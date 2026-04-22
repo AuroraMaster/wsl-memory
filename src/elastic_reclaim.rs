@@ -490,7 +490,7 @@ pub struct GuestLocalConfig {
     pub avail_ratio_low: f32, // 0.15
 
     /// Idle detection (same semantics as host-side config).
-    pub cpu_idle: f32, // 0.05
+    pub cpu_idle: f32, // 5.0 %
     pub io_idle: f32, // 10.0 MB/s
 
     /// Fraction of reclaimable cache to actually reclaim per tick.
@@ -520,7 +520,7 @@ impl Default for GuestLocalConfig {
             cache_ratio_moderate: 0.50,
             cache_ratio_heavy: 0.70,
             avail_ratio_low: 0.15,
-            cpu_idle: 0.05,
+            cpu_idle: 5.0,
             io_idle: 10.0,
             reclaim_fraction_moderate: 0.10,
             reclaim_fraction_heavy: 0.25,

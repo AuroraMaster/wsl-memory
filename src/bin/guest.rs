@@ -1,5 +1,6 @@
 use clap::{ArgAction, Parser};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -314,7 +315,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/sys/fs/cgroup
+ReadWritePaths=/sys/fs/cgroup /proc/sys/vm/compact_memory /proc/sys/vm/drop_caches
 
 [Install]
 WantedBy=multi-user.target
@@ -442,13 +443,12 @@ impl CpuSampler {
     }
 }
 
-fn get_io_rate() -> f32 {
+fn read_disk_sectors() -> u64 {
     let s = match fs::read_to_string("/proc/diskstats") {
         Ok(s) => s,
-        Err(_) => return 0.0,
+        Err(_) => return 0,
     };
-    let total_sectors: u64 = s
-        .lines()
+    s.lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() > 9 {
@@ -459,8 +459,35 @@ fn get_io_rate() -> f32 {
                 None
             }
         })
-        .sum();
-    (total_sectors * 512) as f32 / 1024.0 / 1024.0 / 60.0
+        .sum()
+}
+
+struct IoSampler {
+    prev_sectors: u64,
+    prev_at: Instant,
+}
+
+impl IoSampler {
+    fn new() -> Self {
+        Self {
+            prev_sectors: read_disk_sectors(),
+            prev_at: Instant::now(),
+        }
+    }
+
+    fn sample(&mut self) -> f32 {
+        let now = Instant::now();
+        let sectors = read_disk_sectors();
+        let delta = sectors.saturating_sub(self.prev_sectors);
+        let elapsed = now.duration_since(self.prev_at).as_secs_f32();
+        self.prev_sectors = sectors;
+        self.prev_at = now;
+        if elapsed > 0.0 {
+            delta as f32 * 512.0 / 1024.0 / 1024.0 / elapsed
+        } else {
+            0.0
+        }
+    }
 }
 
 fn discover_gateway_ip() -> Option<String> {
@@ -683,10 +710,34 @@ async fn handle_command(cmd: &CommandMsg, allow_drop: bool) -> Option<Vec<u8>> {
     serde_json::to_vec(&res).ok()
 }
 
-fn collect_metrics(token: &str, cpu: &mut CpuSampler) -> anyhow::Result<Vec<u8>> {
+type CommandCache = VecDeque<(String, Vec<u8>)>;
+
+async fn handle_command_cached(
+    cmd: &CommandMsg,
+    allow_drop: bool,
+    cache: &mut CommandCache,
+) -> Option<Vec<u8>> {
+    if let Some((_, response)) = cache.iter().find(|(cmd_id, _)| cmd_id == &cmd.cmd_id) {
+        info!("duplicate command {}, returning cached result", cmd.cmd_id);
+        return Some(response.clone());
+    }
+
+    let response = handle_command(cmd, allow_drop).await?;
+    cache.push_back((cmd.cmd_id.clone(), response.clone()));
+    if cache.len() > 32 {
+        cache.pop_front();
+    }
+    Some(response)
+}
+
+fn collect_metrics(
+    token: &str,
+    cpu: &mut CpuSampler,
+    io: &mut IoSampler,
+) -> anyhow::Result<Vec<u8>> {
     let (resident, file_cache, anon) = parse_meminfo()?;
     let cpu_percent = cpu.sample();
-    let io_rate = get_io_rate();
+    let io_rate = io.sample();
     let distro = std::env::var("WSL_DISTRO_NAME").unwrap_or_else(|_| "wsl".to_string());
 
     let msg = MetricsMsg {
@@ -717,16 +768,20 @@ async fn run_tcp_loop(
     host_connected.store(true, Ordering::Relaxed);
     let mut buf = vec![0u8; 8192];
     let mut cpu = CpuSampler::new();
+    let mut io = IoSampler::new();
+    let mut command_cache = CommandCache::new();
     let result = async {
         loop {
-            let out = collect_metrics(token, &mut cpu)?;
+            let out = collect_metrics(token, &mut cpu, &mut io)?;
             stream.write_all(&out).await?;
 
             match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
                 Ok(Ok(0)) => return Err(anyhow::anyhow!("server closed connection")),
                 Ok(Ok(n)) if n > 0 => {
                     if let Ok(cmd) = serde_json::from_slice::<CommandMsg>(&buf[..n]) {
-                        if let Some(response) = handle_command(&cmd, allow_drop).await {
+                        if let Some(response) =
+                            handle_command_cached(&cmd, allow_drop, &mut command_cache).await
+                        {
                             let _ = stream.write_all(&response).await;
                         }
                         if let Ok(mut t) = host_last_cmd.lock() {
@@ -763,16 +818,20 @@ async fn run_udp_loop(
 
     let mut buf = vec![0u8; 8192];
     let mut cpu = CpuSampler::new();
+    let mut io = IoSampler::new();
+    let mut command_cache = CommandCache::new();
 
     let result: anyhow::Result<()> = async {
         loop {
-            let out = collect_metrics(token, &mut cpu)?;
+            let out = collect_metrics(token, &mut cpu, &mut io)?;
             sock.send(&out).await?;
 
             match tokio::time::timeout(Duration::from_secs(1), sock.recv(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
                     if let Ok(cmd) = serde_json::from_slice::<CommandMsg>(&buf[..n]) {
-                        if let Some(response) = handle_command(&cmd, allow_drop).await {
+                        if let Some(response) =
+                            handle_command_cached(&cmd, allow_drop, &mut command_cache).await
+                        {
                             let _ = sock.send(&response).await;
                         }
                         if let Ok(mut t) = host_last_cmd.lock() {
@@ -809,13 +868,14 @@ async fn local_reclaim_loop(
     let interval = cfg.check_interval;
     let mut reclaimer = GuestLocalReclaimer::new(cfg);
     let mut cpu = CpuSampler::new();
+    let mut io = IoSampler::new();
 
     info!("local reclaim loop started (interval {:?})", interval);
 
     loop {
         sleep(interval).await;
 
-        let metrics = match collect_local_metrics(&mut cpu) {
+        let metrics = match collect_local_metrics(&mut cpu, &mut io) {
             Some(m) => m,
             None => continue,
         };
@@ -841,7 +901,7 @@ async fn local_reclaim_loop(
     }
 }
 
-fn collect_local_metrics(cpu: &mut CpuSampler) -> Option<GuestLocalMetrics> {
+fn collect_local_metrics(cpu: &mut CpuSampler, io: &mut IoSampler) -> Option<GuestLocalMetrics> {
     let s = fs::read_to_string("/proc/meminfo").ok()?;
     let mut total = 0u64;
     let mut available = 0u64;
@@ -876,7 +936,7 @@ fn collect_local_metrics(cpu: &mut CpuSampler) -> Option<GuestLocalMetrics> {
         file_cache,
         resident,
         cpu_percent: cpu.sample(),
-        io_rate: get_io_rate(),
+        io_rate: io.sample(),
     })
 }
 
