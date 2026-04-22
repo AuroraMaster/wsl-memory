@@ -521,7 +521,7 @@ async fn run_udp_server(
 // ---------------------------------------------------------------------------
 
 pub async fn run_server(cfg: &config::HostConfig, use_tcp: bool) -> anyhow::Result<()> {
-    let listen_addr = &cfg.listen_addr;
+    let listen_addr = cfg.effective_listen_addr();
     let runtime = spawn_config_reloader(cfg.clone());
 
     info!(
@@ -531,7 +531,7 @@ pub async fn run_server(cfg: &config::HostConfig, use_tcp: bool) -> anyhow::Resu
     info!("protocol: {}", if use_tcp { "TCP" } else { "UDP" });
 
     if use_tcp {
-        let listener = TcpListener::bind(listen_addr).await?;
+        let listener = TcpListener::bind(&listen_addr).await?;
         info!("TCP server listening on {}", listen_addr);
 
         let reclaim_config = ReclamationConfig::default();
@@ -544,7 +544,7 @@ pub async fn run_server(cfg: &config::HostConfig, use_tcp: bool) -> anyhow::Resu
             tokio::spawn(handle_connection_elastic(stream, runtime, rc));
         }
     } else {
-        run_udp_server(listen_addr, runtime).await
+        run_udp_server(&listen_addr, runtime).await
     }
 }
 
@@ -594,34 +594,32 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = if let Some(saved) = config::load() {
         info!("loaded config from {}", config::config_path().display());
-        config::HostConfig {
-            listen_addr: if opt.listen != "0.0.0.0:15555" {
-                opt.listen.clone()
-            } else {
-                saved.listen_addr
-            },
-            token_path: opt.token.clone().unwrap_or(saved.token_path),
+        let mut cfg = saved;
+        if opt.listen != "0.0.0.0:15555" {
+            cfg.listen_addr = Some(opt.listen.clone());
         }
+        if let Some(token) = opt.token.clone() {
+            cfg.token_path = token;
+        }
+        cfg
     } else {
-        config::HostConfig {
-            listen_addr: if opt.auto_port {
-                let port = PortManager::select_best_port();
-                info!("auto-selected port: {}", port);
-                format!("0.0.0.0:{}", port)
-            } else {
-                opt.listen.clone()
-            },
-            token_path: opt.token.unwrap_or_else(|| {
-                #[cfg(windows)]
-                {
-                    PathBuf::from(r"C:\Users\Public\wsl_agent_token")
-                }
-                #[cfg(not(windows))]
-                {
-                    PathBuf::from("/tmp/wsl_agent_token")
-                }
-            }),
+        let mut cfg = config::load_or_create()?;
+        if opt.auto_port {
+            let port = PortManager::select_best_port();
+            info!("auto-selected port: {}", port);
+            cfg.listen_ip = "0.0.0.0".to_string();
+            cfg.listen_port = port;
+            cfg.listen_addr = None;
+            config::save(&cfg)?;
+        } else if opt.listen != "0.0.0.0:15555" {
+            cfg.listen_addr = Some(opt.listen.clone());
+            config::save(&cfg)?;
         }
+        if let Some(token) = opt.token {
+            cfg.token_path = token;
+            config::save(&cfg)?;
+        }
+        cfg
     };
 
     let rt = tokio::runtime::Runtime::new()?;

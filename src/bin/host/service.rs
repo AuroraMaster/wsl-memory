@@ -51,7 +51,7 @@ fn run_service_inner() -> anyhow::Result<()> {
         process_id: None,
     })?;
 
-    let config = super::config::load().unwrap_or_default();
+    let config = super::config::load_or_create()?;
 
     // Set up file-based logging for service mode
     let log_dir = super::config::config_dir().join("logs");
@@ -92,7 +92,7 @@ fn run_service_inner() -> anyhow::Result<()> {
 
 pub fn install() -> anyhow::Result<()> {
     let exe_path = std::env::current_exe()?;
-    let config = super::config::load().unwrap_or_default();
+    let config = super::config::load_or_create()?;
     super::config::ensure_token(&config.token_path)?;
     super::config::save(&config)?;
 
@@ -119,11 +119,7 @@ pub fn install() -> anyhow::Result<()> {
     service.set_description(DESCRIPTION)?;
     service.start::<OsString>(&[])?;
 
-    if let Some(port) = config
-        .listen_addr
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok())
-    {
+    if let Some(port) = config.effective_listen_port() {
         super::firewall::add_rule(&[port]).map_err(anyhow::Error::msg)?;
     }
 

@@ -14,13 +14,13 @@ database. Configuration is YAML.
 Run the Windows host installer first from an elevated PowerShell window:
 
 ```powershell
-irm https://github.com/wsl-memory-agent/wsl-memory-agent/releases/latest/download/install-host.ps1 | iex
+irm https://github.com/AuroraMaster/wsl-memory/releases/latest/download/install-host.ps1 | iex
 ```
 
 Then run the guest installer inside each WSL distro:
 
 ```bash
-curl -fsSL https://github.com/wsl-memory-agent/wsl-memory-agent/releases/latest/download/install-guest.sh | sudo sh
+curl -fsSL https://github.com/AuroraMaster/wsl-memory/releases/latest/download/install-guest.sh | sudo sh
 ```
 
 The host installer creates a shared token at:
@@ -41,9 +41,14 @@ Windows host config:
 
 ```yaml
 # %APPDATA%\WSLMemoryAgent\config.yaml
-listen_addr: "0.0.0.0:15555"
+listen_ip: "0.0.0.0"
+listen_port: 15555
 token_path: 'C:\Users\Public\wsl_agent_token'
 ```
+
+If the file does not exist, the host creates it and writes the first available
+recommended port. You can set any listen IP and port in this file. Legacy
+`listen_addr: "0.0.0.0:15555"` is still accepted.
 
 WSL guest config:
 
@@ -57,14 +62,17 @@ multi_path: true
 tcp: false
 ```
 
+`host` can be `auto:multi` for gateway discovery plus recommended-port probing,
+or a fixed endpoint such as `172.24.128.1:15555`.
+
 Both agents reload runtime-safe config every 5 seconds:
 
 - Windows host: `token_path` and token file content
 - WSL guest: `token_path`, `interval`, and `allow_drop`
 
-Network-shaping fields (`listen_addr`, `host`, `multi_path`, `tcp`) require a
-service restart or reconnect because they affect bound sockets and target
-selection.
+Network-shaping fields (`listen_ip`, `listen_port`, `listen_addr`, `host`,
+`multi_path`, `tcp`) require a service restart or reconnect because they affect
+bound sockets and target selection.
 
 `allow_drop` is disabled by default. The guest prefers cgroup v2
 `memory.reclaim`; `drop_caches` is only used when explicitly enabled and when

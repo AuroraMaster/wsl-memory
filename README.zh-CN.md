@@ -19,13 +19,13 @@ WSL Memory Agent 是一个小型 WSL2 内存回收工具，用来缓解 Windows 
 先在 Windows 管理员 PowerShell 中安装 host：
 
 ```powershell
-irm https://github.com/wsl-memory-agent/wsl-memory-agent/releases/latest/download/install-host.ps1 | iex
+irm https://github.com/AuroraMaster/wsl-memory/releases/latest/download/install-host.ps1 | iex
 ```
 
 再进入每个需要管理的 WSL 发行版，安装 guest：
 
 ```bash
-curl -fsSL https://github.com/wsl-memory-agent/wsl-memory-agent/releases/latest/download/install-guest.sh | sudo sh
+curl -fsSL https://github.com/AuroraMaster/wsl-memory/releases/latest/download/install-guest.sh | sudo sh
 ```
 
 Windows 安装脚本会创建共享 token：
@@ -43,7 +43,7 @@ WSL 侧默认从这里读取：
 如果你的 WSL 没有把 Windows C 盘挂载到 `/mnt/c`，可以手动指定 token：
 
 ```bash
-curl -fsSL https://github.com/wsl-memory-agent/wsl-memory-agent/releases/latest/download/install-guest.sh \
+curl -fsSL https://github.com/AuroraMaster/wsl-memory/releases/latest/download/install-guest.sh \
   | sudo WSL_MEMORY_TOKEN_PATH=/usr/local/etc/wsl-memory-agent/token sh
 ```
 
@@ -53,9 +53,14 @@ Windows host 配置：
 
 ```yaml
 # %APPDATA%\WSLMemoryAgent\config.yaml
-listen_addr: "0.0.0.0:15555"
+listen_ip: "0.0.0.0"
+listen_port: 15555
 token_path: 'C:\Users\Public\wsl_agent_token'
 ```
+
+如果配置文件不存在，host 会自动创建配置文件，并写入第一个可用的推荐端口。
+你可以在这里自定义监听 IP 和端口。旧格式
+`listen_addr: "0.0.0.0:15555"` 仍然兼容。
 
 WSL guest 配置：
 
@@ -69,14 +74,17 @@ multi_path: true
 tcp: false
 ```
 
+`host` 可以是 `auto:multi`，表示自动发现网关并探测推荐端口；也可以写成固定
+地址，例如 `172.24.128.1:15555`。
+
 两端会每 5 秒重新读取一次运行中可安全更新的配置：
 
 - Windows host：`token_path` 和 token 文件内容
 - WSL guest：`token_path`、`interval`、`allow_drop`
 
-网络连接类字段需要重启服务或等待重连后生效，包括 `listen_addr`、`host`、
-`multi_path`、`tcp`。这些字段会影响监听 socket 或连接目标，不能在已有连接上
-无缝切换。
+网络连接类字段需要重启服务或等待重连后生效，包括 `listen_ip`、
+`listen_port`、`listen_addr`、`host`、`multi_path`、`tcp`。这些字段会影响监听
+socket 或连接目标，不能在已有连接上无缝切换。
 
 `allow_drop` 默认是 `false`。常规回收走 `/sys/fs/cgroup/memory.reclaim`。
 只有你显式启用 `allow_drop`，并且系统处于临界压力且空闲时，guest 才会尝试

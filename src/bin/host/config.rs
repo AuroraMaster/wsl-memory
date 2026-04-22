@@ -1,22 +1,46 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
+use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 
 const APP_NAME: &str = "WSLMemoryAgent";
+const DEFAULT_LISTEN_IP: &str = "0.0.0.0";
+const DEFAULT_LISTEN_PORT: u16 = 15555;
+const RECOMMENDED_PORTS: &[u16] = &[15555, 15556, 25555, 35555, 45555, 5555];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HostConfig {
-    pub listen_addr: String,
+    pub listen_ip: String,
+    pub listen_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
     pub token_path: PathBuf,
 }
 
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:15555".to_string(),
+            listen_ip: DEFAULT_LISTEN_IP.to_string(),
+            listen_port: DEFAULT_LISTEN_PORT,
+            listen_addr: None,
             token_path: default_token_path(),
         }
+    }
+}
+
+impl HostConfig {
+    pub fn effective_listen_addr(&self) -> String {
+        self.listen_addr
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", self.listen_ip, self.listen_port))
+    }
+
+    pub fn effective_listen_port(&self) -> Option<u16> {
+        self.effective_listen_addr()
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
     }
 }
 
@@ -51,6 +75,18 @@ pub fn config_path() -> PathBuf {
 pub fn load() -> Option<HostConfig> {
     let content = std::fs::read_to_string(config_path()).ok()?;
     serde_yml::from_str(&content).ok()
+}
+
+pub fn load_or_create() -> anyhow::Result<HostConfig> {
+    if let Some(cfg) = load() {
+        return Ok(cfg);
+    }
+    let cfg = HostConfig {
+        listen_port: select_available_port(),
+        ..HostConfig::default()
+    };
+    save(&cfg)?;
+    Ok(cfg)
 }
 
 pub fn save(config: &HostConfig) -> anyhow::Result<()> {
@@ -88,6 +124,19 @@ pub fn ensure_token(path: &PathBuf) -> anyhow::Result<String> {
     Ok(token)
 }
 
+fn select_available_port() -> u16 {
+    RECOMMENDED_PORTS
+        .iter()
+        .copied()
+        .find(|&port| port_available(port))
+        .unwrap_or(DEFAULT_LISTEN_PORT)
+}
+
+fn port_available(port: u16) -> bool {
+    TcpListener::bind((DEFAULT_LISTEN_IP, port)).is_ok()
+        && UdpSocket::bind((DEFAULT_LISTEN_IP, port)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::HostConfig;
@@ -100,10 +149,21 @@ listen_addr: "0.0.0.0:15555"
 token_path: 'C:\Users\Public\wsl_agent_token'
 "#;
         let cfg: HostConfig = serde_yml::from_str(yaml).expect("valid yaml host config");
-        assert_eq!(cfg.listen_addr, "0.0.0.0:15555");
+        assert_eq!(cfg.effective_listen_addr(), "0.0.0.0:15555");
         assert_eq!(
             cfg.token_path,
             PathBuf::from(r"C:\Users\Public\wsl_agent_token")
         );
+    }
+
+    #[test]
+    fn parses_split_ip_port_config() {
+        let yaml = r#"
+listen_ip: "127.0.0.1"
+listen_port: 15556
+token_path: 'C:\Users\Public\wsl_agent_token'
+"#;
+        let cfg: HostConfig = serde_yml::from_str(yaml).expect("valid yaml host config");
+        assert_eq!(cfg.effective_listen_addr(), "127.0.0.1:15556");
     }
 }

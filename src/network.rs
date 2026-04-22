@@ -1,7 +1,7 @@
 // 网络通讯冗余与端口管理模块
 
 use serde::{Deserialize, Serialize};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, UdpSocket as StdUdpSocket};
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -72,7 +72,8 @@ pub struct PortManager;
 impl PortManager {
     /// 检查端口是否可用（可以绑定）
     pub fn is_port_available(port: u16) -> bool {
-        TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok()
+        let addr = format!("0.0.0.0:{}", port);
+        TcpListener::bind(&addr).is_ok() && StdUdpSocket::bind(&addr).is_ok()
     }
 
     /// 批量检查端口

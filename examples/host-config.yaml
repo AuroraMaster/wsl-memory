@@ -1,2 +1,3 @@
-listen_addr: "0.0.0.0:15555"
+listen_ip: "0.0.0.0"
+listen_port: 15555
 token_path: 'C:\Users\Public\wsl_agent_token'

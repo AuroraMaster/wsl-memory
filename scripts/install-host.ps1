@@ -2,7 +2,7 @@ param(
     [string]$ReleaseBase = $env:WSL_MEMORY_RELEASE_BASE,
     [string]$HostUrl = $env:WSL_MEMORY_HOST_URL,
     [string]$InstallDir = "$env:ProgramFiles\WSLMemoryAgent",
-    [string]$Listen = "0.0.0.0:15555",
+    [string]$Listen = "",
     [string]$TokenPath = "C:\Users\Public\wsl_agent_token",
     [switch]$NoStart
 )
@@ -28,11 +28,34 @@ function New-TokenIfMissing([string]$Path) {
     [Convert]::ToBase64String($bytes).TrimEnd("=") | Set-Content -NoNewline -Encoding ascii -LiteralPath $Path
 }
 
+function Test-PortAvailable([int]$Port) {
+    $tcp = $null
+    $udp = $null
+    try {
+        $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
+        $tcp.Start()
+        $udp = [System.Net.Sockets.UdpClient]::new($Port)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($tcp) { $tcp.Stop() }
+        if ($udp) { $udp.Dispose() }
+    }
+}
+
+function Select-ListenPort {
+    foreach ($port in @(15555, 15556, 25555, 35555, 45555, 5555)) {
+        if (Test-PortAvailable $port) { return $port }
+    }
+    return 15555
+}
+
 Assert-Administrator
 
 if (-not $HostUrl) {
     if (-not $ReleaseBase) {
-        $ReleaseBase = "https://github.com/wsl-memory-agent/wsl-memory-agent/releases/latest/download"
+        $ReleaseBase = "https://github.com/AuroraMaster/wsl-memory/releases/latest/download"
     }
     $HostUrl = "$ReleaseBase/host.exe"
 }
@@ -60,8 +83,17 @@ New-TokenIfMissing $TokenPath
 $configDir = Join-Path $env:APPDATA "WSLMemoryAgent"
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 $YamlTokenPath = $TokenPath.Replace("'", "''")
+if (-not $Listen) {
+    $ListenPort = Select-ListenPort
+    $ListenIp = "0.0.0.0"
+} else {
+    $ListenIp, $ListenPortText = $Listen -split ':', 2
+    if (-not $ListenIp) { $ListenIp = "0.0.0.0" }
+    $ListenPort = [int]$ListenPortText
+}
 @"
-listen_addr: "$Listen"
+listen_ip: "$ListenIp"
+listen_port: $ListenPort
 token_path: '$YamlTokenPath'
 "@ | Set-Content -Encoding utf8 -LiteralPath (Join-Path $configDir "config.yaml")
 

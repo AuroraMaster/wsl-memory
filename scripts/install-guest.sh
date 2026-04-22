@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-RELEASE_BASE="${WSL_MEMORY_RELEASE_BASE:-https://github.com/wsl-memory-agent/wsl-memory-agent/releases/latest/download}"
+RELEASE_BASE="${WSL_MEMORY_RELEASE_BASE:-https://github.com/AuroraMaster/wsl-memory/releases/latest/download}"
 GUEST_URL="${WSL_MEMORY_GUEST_URL:-$RELEASE_BASE/wsl-memory-guest}"
 INSTALL_PATH="${WSL_MEMORY_GUEST_INSTALL_PATH:-/usr/local/bin/wsl-memory-guest}"
 CONFIG_DIR="${WSL_MEMORY_CONFIG_DIR:-/usr/local/etc/wsl-memory-agent}"
