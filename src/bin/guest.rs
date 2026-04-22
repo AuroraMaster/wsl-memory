@@ -582,9 +582,9 @@ fn discover_gateway_ip() -> Option<String> {
 /// Available reclamation interfaces, probed once at startup.
 #[derive(Debug)]
 struct ReclaimCapabilities {
-    /// Path to `memory.reclaim` (cgroup v2).
+    /// Candidate `memory.reclaim` paths (cgroup v2), preferred first.
     /// Requires kernel >= 5.19, cgroup v2, and CONFIG_MEMCG=y.
-    memory_reclaim: Option<String>,
+    memory_reclaim: Vec<String>,
     /// `/proc/sys/vm/compact_memory` — requires CONFIG_COMPACTION=y.
     compact: bool,
     /// `/proc/sys/vm/drop_caches` — available since Linux 2.6.16.
@@ -594,13 +594,17 @@ struct ReclaimCapabilities {
 static CAPS: OnceLock<ReclaimCapabilities> = OnceLock::new();
 
 fn probe_capabilities() -> ReclaimCapabilities {
-    let memory_reclaim = detect_memory_reclaim_path();
+    let memory_reclaim = detect_memory_reclaim_paths();
     let compact = Path::new("/proc/sys/vm/compact_memory").exists();
     let drop_caches = Path::new("/proc/sys/vm/drop_caches").exists();
 
     info!(
         "reclaim capabilities: memory.reclaim={}, compact={}, drop_caches={}",
-        memory_reclaim.as_deref().unwrap_or("unavailable"),
+        if memory_reclaim.is_empty() {
+            "unavailable".to_string()
+        } else {
+            memory_reclaim.join(",")
+        },
         compact,
         drop_caches,
     );
@@ -619,8 +623,9 @@ fn probe_capabilities() -> ReclaimCapabilities {
 /// `/proc/self/cgroup` (cgroup v2: single `0::/<path>` line) and construct
 /// the full sysfs path.  Falls back to `/sys/fs/cgroup/memory.reclaim` if
 /// detection fails.
-fn detect_memory_reclaim_path() -> Option<String> {
+fn detect_memory_reclaim_paths() -> Vec<String> {
     let cgroup_base = "/sys/fs/cgroup";
+    let mut paths = Vec::new();
 
     let rel = fs::read_to_string("/proc/self/cgroup")
         .ok()
@@ -640,15 +645,15 @@ fn detect_memory_reclaim_path() -> Option<String> {
     };
 
     if Path::new(&path).exists() {
-        return Some(path);
+        paths.push(path);
     }
 
     let fallback = format!("{}/memory.reclaim", cgroup_base);
-    if Path::new(&fallback).exists() {
-        return Some(fallback);
+    if Path::new(&fallback).exists() && !paths.iter().any(|p| p == &fallback) {
+        paths.push(fallback);
     }
 
-    None
+    paths
 }
 
 fn caps() -> &'static ReclaimCapabilities {
@@ -667,7 +672,11 @@ async fn execute_reclaim(bytes: u64) -> Result<u64, String> {
     info!("executing reclaim: {} bytes", bytes);
     let before_cache = parse_meminfo().ok().map(|(_, c, _)| c).unwrap_or(0);
 
-    if let Some(path) = &caps().memory_reclaim {
+    if caps().memory_reclaim.is_empty() {
+        warn!("memory.reclaim unavailable (needs cgroup v2 + kernel >= 5.19)");
+    }
+
+    for path in &caps().memory_reclaim {
         match fs::write(path, bytes.to_string()) {
             Ok(()) => {
                 sleep(Duration::from_secs(2)).await;
@@ -680,8 +689,6 @@ async fn execute_reclaim(bytes: u64) -> Result<u64, String> {
                 warn!("memory.reclaim write failed ({}): {}", path, e);
             }
         }
-    } else {
-        warn!("memory.reclaim unavailable (needs cgroup v2 + kernel >= 5.19)");
     }
 
     if caps().compact {
