@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+CONFIG_DIR=/usr/local/etc/wsl-memory-agent
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+
+mkdir -p "$CONFIG_DIR"
+if [ ! -f "$CONFIG_FILE" ]; then
+cat > "$CONFIG_FILE" <<'EOF'
+host: auto:multi
+token_path: /mnt/c/Users/Public/wsl_agent_token
+interval: 4
+allow_drop: false
+multi_path: true
+tcp: false
+EOF
+fi
+
+systemctl daemon-reload
+systemctl enable wsl-memory-guest
+systemctl start wsl-memory-guest || true

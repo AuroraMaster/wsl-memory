@@ -1,0 +1,23 @@
+[Unit]
+Description=WSL Memory Guest Agent
+Documentation=https://github.com/microsoft/WSL/issues/4166
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wsl-memory-guest --config /usr/local/etc/wsl-memory-agent/config.yaml
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsl-memory-guest
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/sys/fs/cgroup /proc/sys/vm/compact_memory /proc/sys/vm/drop_caches
+
+[Install]
+WantedBy=multi-user.target

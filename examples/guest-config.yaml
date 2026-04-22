@@ -1,0 +1,6 @@
+host: auto:multi
+token_path: /mnt/c/Users/Public/wsl_agent_token
+interval: 4
+allow_drop: false
+multi_path: true
+tcp: false

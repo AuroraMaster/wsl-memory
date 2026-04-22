@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+systemctl stop wsl-memory-guest || true
+systemctl disable wsl-memory-guest || true

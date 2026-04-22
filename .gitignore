@@ -1,0 +1,14 @@
+target/
+.cursor/
+.idea/
+.vscode/
+
+*.pdb
+*.log
+*.tmp
+*.bak
+*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
