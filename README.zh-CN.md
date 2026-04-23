@@ -168,6 +168,7 @@ Windows 服务：
 
 ```powershell
 Get-Service WSLMemoryHost
+schtasks /Query /TN WSLMemoryHost /V /FO LIST
 ```
 
 WSL 服务：

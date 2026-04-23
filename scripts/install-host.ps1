@@ -51,6 +51,20 @@ function Select-ListenPort {
     return 15555
 }
 
+function Install-StartupTask([string]$ExePath, [string]$InstallDir) {
+    $taskName = "WSLMemoryHost"
+    $runner = Join-Path $InstallDir "run-host.ps1"
+    @"
+`$ErrorActionPreference = 'Stop'
+& '$ExePath'
+"@ | Set-Content -Encoding utf8 -LiteralPath $runner
+
+    schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+    $taskRun = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`""
+    schtasks.exe /Create /TN $taskName /SC ONLOGON /RL HIGHEST /TR $taskRun /F | Out-Null
+    schtasks.exe /Run /TN $taskName | Out-Null
+}
+
 Assert-Administrator
 
 if (-not $HostUrl) {
@@ -76,6 +90,7 @@ if ($svc) {
     }
     Start-Sleep -Seconds 2
 }
+schtasks.exe /Delete /TN WSLMemoryHost /F 2>$null | Out-Null
 
 Invoke-WebRequest -Uri $HostUrl -OutFile $HostExe
 New-TokenIfMissing $TokenPath
@@ -103,7 +118,17 @@ if ($NoStart) {
     exit 0
 }
 
-& $HostExe --install
+try {
+    & $HostExe --install
+    $service = Get-Service -Name WSLMemoryHost -ErrorAction SilentlyContinue
+    if (-not $service -or $service.Status -ne "Running") {
+        throw "Windows service did not reach Running state."
+    }
+} catch {
+    Write-Warning "Windows service install/start failed; using scheduled-task startup fallback. $_"
+    sc.exe delete WSLMemoryHost 2>$null | Out-Null
+    Install-StartupTask -ExePath $HostExe -InstallDir $InstallDir
+}
 
 Write-Host ""
 Write-Host "WSL Memory Host is installed and running."

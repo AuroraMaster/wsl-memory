@@ -155,6 +155,7 @@ Check the Windows service:
 
 ```powershell
 Get-Service WSLMemoryHost
+schtasks /Query /TN WSLMemoryHost /V /FO LIST
 ```
 
 Check the WSL service:
