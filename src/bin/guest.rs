@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 use wsl_memory_agent::{
     diagnose_port_conflicts, GuestLocalAction, GuestLocalConfig, GuestLocalMetrics,
     GuestLocalReclaimer, MultiPathConfig, MultiPathConnector, RECOMMENDED_PORTS,
@@ -93,6 +94,7 @@ struct GuestConfig {
     allow_drop: bool,
     multi_path: bool,
     tcp: bool,
+    local_reclaim: GuestLocalConfig,
 }
 
 impl Default for GuestConfig {
@@ -104,6 +106,7 @@ impl Default for GuestConfig {
             allow_drop: false,
             multi_path: true,
             tcp: false,
+            local_reclaim: GuestLocalConfig::default(),
         }
     }
 }
@@ -772,7 +775,9 @@ async fn handle_command(cmd: &CommandMsg, allow_drop: bool) -> Option<Vec<u8>> {
         freed_bytes,
         note: &note,
     };
-    serde_json::to_vec(&res).ok()
+    let mut bytes = serde_json::to_vec(&res).ok()?;
+    bytes.push(b'\n');
+    Some(bytes)
 }
 
 type CommandCache = VecDeque<(String, Vec<u8>)>;
@@ -823,35 +828,44 @@ fn collect_metrics(
 // ---------------------------------------------------------------------------
 
 async fn run_tcp_loop(
-    mut stream: TcpStream,
+    stream: TcpStream,
     runtime: Arc<RwLock<GuestRuntimeConfig>>,
     host_last_cmd: Arc<Mutex<Option<Instant>>>,
     host_connected: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     host_connected.store(true, Ordering::Relaxed);
-    let mut buf = vec![0u8; 8192];
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut buf = Vec::with_capacity(8192);
     let mut cpu = CpuSampler::new();
     let mut io = IoSampler::new();
     let mut command_cache = CommandCache::new();
     let result = async {
         loop {
             let rt = current_runtime(&runtime);
-            let out = collect_metrics(&rt.token, &mut cpu, &mut io)?;
-            stream.write_all(&out).await?;
+            let mut out = collect_metrics(&rt.token, &mut cpu, &mut io)?;
+            out.push(b'\n');
+            write_half.write_all(&out).await?;
 
-            match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_secs(1), reader.read_until(b'\n', &mut buf))
+                .await
+            {
                 Ok(Ok(0)) => return Err(anyhow::anyhow!("server closed connection")),
-                Ok(Ok(n)) if n > 0 => {
-                    if let Ok(cmd) = serde_json::from_slice::<CommandMsg>(&buf[..n]) {
+                Ok(Ok(_)) => {
+                    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                        buf.pop();
+                    }
+                    if let Ok(cmd) = serde_json::from_slice::<CommandMsg>(&buf) {
                         if let Some(response) =
                             handle_command_cached(&cmd, rt.allow_drop, &mut command_cache).await
                         {
-                            let _ = stream.write_all(&response).await;
+                            let _ = write_half.write_all(&response).await;
                         }
                         if let Ok(mut t) = host_last_cmd.lock() {
                             *t = Some(Instant::now());
                         }
                     }
+                    buf.clear();
                 }
                 _ => {}
             }
@@ -925,11 +939,11 @@ async fn run_udp_loop(
 async fn local_reclaim_loop(
     host_last_cmd: Arc<Mutex<Option<Instant>>>,
     host_connected: Arc<AtomicBool>,
-    _allow_drop: bool,
+    runtime: Arc<RwLock<GuestRuntimeConfig>>,
+    local_reclaim: GuestLocalConfig,
 ) {
-    let cfg = GuestLocalConfig::default();
-    let interval = cfg.check_interval;
-    let mut reclaimer = GuestLocalReclaimer::new(cfg);
+    let interval = local_reclaim.check_interval;
+    let mut reclaimer = GuestLocalReclaimer::new(local_reclaim);
     let mut cpu = CpuSampler::new();
     let mut io = IoSampler::new();
 
@@ -951,6 +965,7 @@ async fn local_reclaim_loop(
             GuestLocalAction::Nothing => {}
             GuestLocalAction::Reclaim { bytes } => {
                 let connected = host_connected.load(Ordering::Relaxed);
+                let _allow_drop = current_runtime(&runtime).allow_drop;
                 info!(
                     "local reclaim: {} bytes (host_connected={})",
                     bytes, connected
@@ -962,6 +977,12 @@ async fn local_reclaim_loop(
             }
         }
     }
+}
+
+fn init_tracing(default_level: &str) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level.to_string()));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 fn collect_local_metrics(cpu: &mut CpuSampler, io: &mut IoSampler) -> Option<GuestLocalMetrics> {
@@ -1027,12 +1048,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Agent mode --------------------------------------------------------
-    tracing_subscriber::fmt::init();
+    let cfg = GuestConfig::load(&opt.config)?.merged_with_cli(&opt);
+    init_tracing("info");
 
     // Probe kernel interfaces early so the log shows capabilities.
     let _ = caps();
-
-    let cfg = GuestConfig::load(&opt.config)?.merged_with_cli(&opt);
     info!("loaded guest config from {}", opt.config.display());
 
     let runtime_initial = load_runtime_config(&opt.config, &opt).unwrap_or_else(|e| {
@@ -1054,7 +1074,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(local_reclaim_loop(
         Arc::clone(&host_last_cmd),
         Arc::clone(&host_connected),
-        cfg.allow_drop,
+        Arc::clone(&runtime),
+        cfg.local_reclaim.clone(),
     ));
 
     // Resolve target address.

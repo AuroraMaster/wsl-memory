@@ -12,6 +12,26 @@ interval: 4
 allow_drop: false
 multi_path: true
 tcp: false
+local_reclaim:
+  cache_ratio_moderate: 0.50
+  cache_ratio_heavy: 0.70
+  avail_ratio_low: 0.15
+  cpu_idle: 5.0
+  io_idle: 10.0
+  reclaim_fraction_moderate: 0.10
+  reclaim_fraction_heavy: 0.25
+  reclaim_floor_ratio: 0.002
+  reclaim_cap_ratio: 0.010
+  sustained_ticks: 3
+  cooldown:
+    secs: 15
+    nanos: 0
+  host_defer:
+    secs: 30
+    nanos: 0
+  check_interval:
+    secs: 5
+    nanos: 0
 EOF
 fi
 

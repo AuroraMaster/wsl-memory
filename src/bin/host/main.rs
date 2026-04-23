@@ -2,6 +2,7 @@ mod config;
 
 #[cfg(windows)]
 mod firewall;
+mod logging;
 #[cfg(windows)]
 mod service;
 
@@ -12,10 +13,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 use wsl_memory_agent::{
     diagnose_port_conflicts, ElasticReclaimer, PortManager, PressureLevel, ReclamationAction,
     ReclamationConfig, SystemMetrics,
@@ -195,7 +197,13 @@ fn validate_token(val: &serde_json::Value, expected: &Option<String>) -> bool {
 }
 
 fn load_runtime_config(base: &config::HostConfig) -> HostRuntimeConfig {
-    let cfg = config::load().unwrap_or_else(|| base.clone());
+    let cfg = if base.token_path_locked {
+        base.clone()
+    } else {
+        let mut cfg = config::load().unwrap_or_else(|| base.clone());
+        cfg.token_path_locked = base.token_path_locked;
+        cfg
+    };
     let token = std::fs::read_to_string(&cfg.token_path)
         .ok()
         .map(|t| t.trim().to_string())
@@ -225,20 +233,25 @@ fn spawn_config_reloader(base: config::HostConfig) -> Arc<RwLock<HostRuntimeConf
     runtime
 }
 
-async fn send_command_tcp(stream: &mut TcpStream, cmd: &CommandMsg) -> bool {
-    match serde_json::to_vec(cmd) {
-        Ok(out) => {
-            if let Err(e) = stream.write_all(&out).await {
-                warn!("failed send TCP command: {}", e);
-                false
-            } else {
-                true
+async fn read_json_line<R>(
+    reader: &mut BufReader<R>,
+    buf: &mut Vec<u8>,
+) -> Result<Option<String>, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    buf.clear();
+    match reader.read_until(b'\n', buf).await {
+        Ok(0) => Ok(None),
+        Ok(_) => {
+            while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                buf.pop();
             }
+            String::from_utf8(buf.clone())
+                .map(Some)
+                .map_err(|e| format!("invalid utf8: {}", e))
         }
-        Err(e) => {
-            warn!("failed serialize command: {}", e);
-            false
-        }
+        Err(e) => Err(format!("read error: {}", e)),
     }
 }
 
@@ -310,12 +323,14 @@ fn build_action_command(
 // ---------------------------------------------------------------------------
 
 async fn handle_connection_elastic(
-    mut stream: TcpStream,
+    stream: TcpStream,
     runtime: Arc<RwLock<HostRuntimeConfig>>,
     reclaim_config: ReclamationConfig,
 ) {
     let peer = stream.peer_addr().ok();
     info!("accepted TCP connection from {:?}", peer);
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     let mut sys = create_system();
     let mut state = ConnectionState {
@@ -323,29 +338,21 @@ async fn handle_connection_elastic(
         distro_name: String::from("unknown"),
     };
 
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = Vec::with_capacity(16 * 1024);
     loop {
-        let n = match stream.read(&mut buf).await {
-            Ok(0) => {
+        let s = match read_json_line(&mut reader, &mut buf).await {
+            Ok(None) => {
                 info!("connection closed by peer {:?}", peer);
                 return;
             }
-            Ok(n) => n,
+            Ok(Some(s)) => s,
             Err(e) => {
-                error!("read error: {}", e);
+                error!("{}", e);
                 return;
             }
         };
 
-        let s = match std::str::from_utf8(&buf[..n]) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("invalid utf8: {}", e);
-                continue;
-            }
-        };
-
-        let val = match serde_json::from_str::<serde_json::Value>(s) {
+        let val = match serde_json::from_str::<serde_json::Value>(&s) {
             Ok(v) => v,
             Err(e) => {
                 warn!("json parse error: {}", e);
@@ -357,7 +364,7 @@ async fn handle_connection_elastic(
             Some("metrics") => {
                 let token = current_runtime(&runtime).token;
                 if !validate_token(&val, &token) {
-                    let _ = stream.shutdown().await;
+                    let _ = write_half.shutdown().await;
                     return;
                 }
 
@@ -370,15 +377,28 @@ async fn handle_connection_elastic(
                 };
 
                 if let Some(cmd) = process_elastic_metrics(&m, &mut state, &mut sys) {
-                    send_command_tcp(&mut stream, &cmd).await;
+                    match serde_json::to_vec(&cmd) {
+                        Ok(mut out) => {
+                            out.push(b'\n');
+                            if let Err(e) = write_half.write_all(&out).await {
+                                warn!("failed send TCP command: {}", e);
+                                return;
+                            }
+                        }
+                        Err(e) => warn!("failed serialize command: {}", e),
+                    }
                 }
             }
             Some("result") => {
-                info!("received result: {}", s);
+                debug_log_result(&s);
             }
             _ => {}
         }
     }
+}
+
+fn debug_log_result(s: &str) {
+    tracing::debug!("received result: {}", s);
 }
 
 /// Shared logic: process a metrics message through the elastic algorithm.
@@ -404,7 +424,7 @@ fn process_elastic_metrics(
         gap,
     };
 
-    info!(
+    tracing::debug!(
         "metrics from {} gap={:.2}GB vmmem={:.2}GB guest={:.2}GB cache={:.2}GB",
         state.distro_name,
         gap as f64 / 1024.0 / 1024.0 / 1024.0,
@@ -417,7 +437,7 @@ fn process_elastic_metrics(
     let action = state.reclaimer.decide_action();
     let diagnostics = state.reclaimer.get_diagnostics();
     let pressure = state.reclaimer.calculate_pressure_level();
-    info!("diagnostics: {}", diagnostics);
+    tracing::debug!("diagnostics: {}", diagnostics);
 
     build_action_command(action, &diagnostics, pressure)
 }
@@ -439,11 +459,10 @@ struct UdpGuestState {
 async fn run_udp_server(
     listen_addr: &str,
     runtime: Arc<RwLock<HostRuntimeConfig>>,
+    reclaim_config: ReclamationConfig,
 ) -> anyhow::Result<()> {
     let sock = UdpSocket::bind(listen_addr).await?;
     info!("UDP server listening on {}", listen_addr);
-
-    let reclaim_config = ReclamationConfig::default();
     let mut sys = create_system();
 
     let mut guests: HashMap<SocketAddr, UdpGuestState> = HashMap::new();
@@ -474,7 +493,7 @@ async fn run_udp_server(
                 continue;
             }
             Some("result") => {
-                info!("received result from {}: {}", src, s);
+                tracing::debug!("received result from {}: {}", src, s);
                 if let Some(gs) = guests.get_mut(&src) {
                     gs.pending_cmd = None;
                 }
@@ -516,6 +535,12 @@ async fn run_udp_server(
     }
 }
 
+pub fn init_tracing(default_level: &str) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level.to_string()));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
 // ---------------------------------------------------------------------------
 // Server entry point (shared between foreground and service modes)
 // ---------------------------------------------------------------------------
@@ -534,7 +559,7 @@ pub async fn run_server(cfg: &config::HostConfig, use_tcp: bool) -> anyhow::Resu
         let listener = TcpListener::bind(&listen_addr).await?;
         info!("TCP server listening on {}", listen_addr);
 
-        let reclaim_config = ReclamationConfig::default();
+        let reclaim_config = cfg.reclamation.clone();
 
         loop {
             let (stream, _) = listener.accept().await?;
@@ -544,7 +569,7 @@ pub async fn run_server(cfg: &config::HostConfig, use_tcp: bool) -> anyhow::Resu
             tokio::spawn(handle_connection_elastic(stream, runtime, rc));
         }
     } else {
-        run_udp_server(&listen_addr, runtime).await
+        run_udp_server(&listen_addr, runtime, cfg.reclamation.clone()).await
     }
 }
 
@@ -571,13 +596,13 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         if opt.install {
-            tracing_subscriber::fmt::init();
+            init_tracing("info");
             info!("installing service");
             return service::install();
         }
 
         if opt.uninstall {
-            tracing_subscriber::fmt::init();
+            init_tracing("info");
             info!("uninstalling service");
             return service::uninstall();
         }
@@ -590,16 +615,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // --- Foreground mode ---------------------------------------------------
-    tracing_subscriber::fmt::init();
-
     let cfg = if let Some(saved) = config::load() {
-        info!("loaded config from {}", config::config_path().display());
         let mut cfg = saved;
         if opt.listen != "0.0.0.0:15555" {
             cfg.listen_addr = Some(opt.listen.clone());
         }
         if let Some(token) = opt.token.clone() {
             cfg.token_path = token;
+            cfg.token_path_locked = true;
         }
         cfg
     } else {
@@ -617,10 +640,13 @@ fn main() -> anyhow::Result<()> {
         }
         if let Some(token) = opt.token {
             cfg.token_path = token;
+            cfg.token_path_locked = true;
             config::save(&cfg)?;
         }
         cfg
     };
+    init_tracing(&cfg.logging.level);
+    info!("loaded config from {}", config::config_path().display());
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_server(&cfg, opt.tcp))

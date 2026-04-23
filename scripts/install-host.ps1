@@ -110,6 +110,15 @@ if (-not $Listen) {
 listen_ip: "$ListenIp"
 listen_port: $ListenPort
 token_path: '$YamlTokenPath'
+remote_ips:
+  - "127.0.0.1"
+  - "::1"
+  - "172.16.0.0/12"
+logging:
+  level: info
+  max_file_size_mb: 8
+  max_files: 5
+  max_age_days: 7
 "@ | Set-Content -Encoding utf8 -LiteralPath (Join-Path $configDir "config.yaml")
 
 if ($NoStart) {

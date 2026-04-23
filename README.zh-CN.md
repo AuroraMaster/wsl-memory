@@ -56,6 +56,21 @@ Windows host 配置：
 listen_ip: "0.0.0.0"
 listen_port: 15555
 token_path: 'C:\Users\Public\wsl_agent_token'
+remote_ips:
+  - "127.0.0.1"
+  - "::1"
+  - "172.16.0.0/12"
+logging:
+  level: info
+  max_file_size_mb: 8
+  max_files: 5
+  max_age_days: 7
+reclamation:
+  baseline_gap: 2147483648
+  gap_ratio_mild: 0.01
+  gap_ratio_moderate: 0.03
+  gap_ratio_heavy: 0.06
+  gap_ratio_critical: 0.12
 ```
 
 如果配置文件不存在，host 会自动创建配置文件，并写入第一个可用的推荐端口。
@@ -72,6 +87,12 @@ interval: 4
 allow_drop: false
 multi_path: true
 tcp: false
+local_reclaim:
+  cache_ratio_moderate: 0.50
+  cache_ratio_heavy: 0.70
+  avail_ratio_low: 0.15
+  cpu_idle: 5.0
+  io_idle: 10.0
 ```
 
 `host` 可以是 `auto:multi`，表示自动发现网关并探测推荐端口；也可以写成固定
@@ -85,6 +106,12 @@ tcp: false
 网络连接类字段需要重启服务或等待重连后生效，包括 `listen_ip`、
 `listen_port`、`listen_addr`、`host`、`multi_path`、`tcp`。这些字段会影响监听
 socket 或连接目标，不能在已有连接上无缝切换。
+
+host 侧 `reclamation` 用来调节自适应回收阈值；guest 侧 `local_reclaim` 用来调节
+host 不可达时的本地保守回收逻辑。修改这些段后需要重启对应服务。
+
+host 服务日志现在支持按大小轮转并按保留数量/天数清理；guest 日志仍然进入
+`journald`，但安装的 service unit 已加基础限流，避免异常场景下刷屏。
 
 `allow_drop` 默认是 `false`。常规回收走 `/sys/fs/cgroup/memory.reclaim`。
 只有你显式启用 `allow_drop`，并且系统处于临界压力且空闲时，guest 才会尝试

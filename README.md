@@ -44,6 +44,21 @@ Windows host config:
 listen_ip: "0.0.0.0"
 listen_port: 15555
 token_path: 'C:\Users\Public\wsl_agent_token'
+remote_ips:
+  - "127.0.0.1"
+  - "::1"
+  - "172.16.0.0/12"
+logging:
+  level: info
+  max_file_size_mb: 8
+  max_files: 5
+  max_age_days: 7
+reclamation:
+  baseline_gap: 2147483648
+  gap_ratio_mild: 0.01
+  gap_ratio_moderate: 0.03
+  gap_ratio_heavy: 0.06
+  gap_ratio_critical: 0.12
 ```
 
 If the file does not exist, the host creates it and writes the first available
@@ -60,6 +75,12 @@ interval: 4
 allow_drop: false
 multi_path: true
 tcp: false
+local_reclaim:
+  cache_ratio_moderate: 0.50
+  cache_ratio_heavy: 0.70
+  avail_ratio_low: 0.15
+  cpu_idle: 5.0
+  io_idle: 10.0
 ```
 
 `host` can be `auto:multi` for gateway discovery plus recommended-port probing,
@@ -73,6 +94,15 @@ Both agents reload runtime-safe config every 5 seconds:
 Network-shaping fields (`listen_ip`, `listen_port`, `listen_addr`, `host`,
 `multi_path`, `tcp`) require a service restart or reconnect because they affect
 bound sockets and target selection.
+
+The host-side `reclamation` section tunes the adaptive scoring thresholds. The
+guest-side `local_reclaim` section tunes the offline fallback reclaimer. These
+sections are read on startup, so restart the corresponding service after
+editing them.
+
+Host service logs now rotate by size and age using the `logging` section.
+Guest logs still go to `journald`, with service-level rate limiting enabled in
+the installed unit.
 
 `allow_drop` is disabled by default. The guest prefers cgroup v2
 `memory.reclaim`; `drop_caches` is only used when explicitly enabled and when

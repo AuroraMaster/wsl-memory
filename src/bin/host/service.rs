@@ -55,13 +55,16 @@ fn run_service_inner() -> anyhow::Result<()> {
 
     // Set up file-based logging for service mode
     let log_dir = super::config::config_dir().join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log_file = std::fs::File::create(log_dir.join("host.log")).ok();
-    if let Some(file) = log_file {
-        tracing_subscriber::fmt()
-            .with_writer(std::sync::Mutex::new(file))
-            .init();
-    }
+    let writer = super::logging::SharedRotatingWriter::new(
+        log_dir.join("host.log"),
+        config.logging.clone(),
+    )?;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.logging.level.clone()));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .try_init();
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -120,7 +123,7 @@ pub fn install() -> anyhow::Result<()> {
     service.start::<OsString>(&[])?;
 
     if let Some(port) = config.effective_listen_port() {
-        super::firewall::add_rule(&[port]).map_err(anyhow::Error::msg)?;
+        super::firewall::add_rule(&[port], &config.remote_ips).map_err(anyhow::Error::msg)?;
     }
 
     tracing::info!("service installed and started");

@@ -3,11 +3,15 @@
 use serde::{Deserialize, Serialize};
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
+use wsl_memory_agent::ReclamationConfig;
+
+use super::logging::HostLoggingConfig;
 
 const APP_NAME: &str = "WSLMemoryAgent";
 const DEFAULT_LISTEN_IP: &str = "0.0.0.0";
 const DEFAULT_LISTEN_PORT: u16 = 15555;
 const RECOMMENDED_PORTS: &[u16] = &[15555, 15556, 25555, 35555, 45555, 5555];
+const DEFAULT_REMOTE_IPS: &[&str] = &["127.0.0.1", "::1", "172.16.0.0/12"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,6 +21,11 @@ pub struct HostConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
     pub token_path: PathBuf,
+    #[serde(skip)]
+    pub token_path_locked: bool,
+    pub remote_ips: Vec<String>,
+    pub reclamation: ReclamationConfig,
+    pub logging: HostLoggingConfig,
 }
 
 impl Default for HostConfig {
@@ -26,6 +35,10 @@ impl Default for HostConfig {
             listen_port: DEFAULT_LISTEN_PORT,
             listen_addr: None,
             token_path: default_token_path(),
+            token_path_locked: false,
+            remote_ips: DEFAULT_REMOTE_IPS.iter().map(|s| s.to_string()).collect(),
+            reclamation: ReclamationConfig::default(),
+            logging: HostLoggingConfig::default(),
         }
     }
 }
