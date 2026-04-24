@@ -71,6 +71,26 @@ reclamation:
   gap_ratio_moderate: 0.03
   gap_ratio_heavy: 0.06
   gap_ratio_critical: 0.12
+  host_memory_warning: 0.70
+  host_memory_pressure: 0.80
+  guest_cpu_idle: 0.05
+  guest_mem_available_idle_ratio: 0.15
+  guest_io_idle: 10.0
+  reclaim_ratio_moderate: 0.20
+  reclaim_ratio_heavy: 0.50
+  reclaim_floor_ratio: 0.001
+  reclaim_cap_moderate: 0.008
+  reclaim_cap_heavy: 0.016
+  sustained_windows: 3
+  cooldown_moderate:
+    secs: 10
+    nanos: 0
+  cooldown_heavy:
+    secs: 30
+    nanos: 0
+  cooldown_critical:
+    secs: 600
+    nanos: 0
 ```
 
 如果配置文件不存在，host 会自动创建配置文件，并写入第一个可用的推荐端口。
@@ -93,6 +113,20 @@ local_reclaim:
   avail_ratio_low: 0.15
   cpu_idle: 5.0
   io_idle: 10.0
+  reclaim_fraction_moderate: 0.10
+  reclaim_fraction_heavy: 0.25
+  reclaim_floor_ratio: 0.002
+  reclaim_cap_ratio: 0.010
+  sustained_ticks: 3
+  cooldown:
+    secs: 15
+    nanos: 0
+  host_defer:
+    secs: 30
+    nanos: 0
+  check_interval:
+    secs: 5
+    nanos: 0
 ```
 
 `host` 可以是 `auto:multi`，表示自动发现网关并探测推荐端口；也可以写成固定
@@ -107,15 +141,20 @@ local_reclaim:
 `listen_port`、`listen_addr`、`host`、`multi_path`、`tcp`。这些字段会影响监听
 socket 或连接目标，不能在已有连接上无缝切换。
 
-host 侧 `reclamation` 用来调节自适应回收阈值；guest 侧 `local_reclaim` 用来调节
-host 不可达时的本地保守回收逻辑。修改这些段后需要重启对应服务。
+host 侧 `reclamation` 用来调节自适应回收阈值和 Critical `drop_caches` 的空闲门槛。
+`guest_cpu_idle` 使用 Linux guest 从 `/proc/stat` 上报的 CPU；`guest_mem_available_idle_ratio`
+使用 guest `/proc/meminfo` 的 `MemAvailable / MemTotal`。`guest_io_idle` 保留用于兼容旧配置，
+但不再参与 Critical `drop_caches` 的空闲判断。
+
+guest 侧 `local_reclaim` 用来调节 host 不可达时的本地保守回收逻辑。修改这些段后需要
+重启对应服务。
 
 host 服务日志现在支持按大小轮转并按保留数量/天数清理；guest 日志仍然进入
 `journald`，但安装的 service unit 已加基础限流，避免异常场景下刷屏。
 
 `allow_drop` 默认是 `false`。常规回收走 `/sys/fs/cgroup/memory.reclaim`。
-只有你显式启用 `allow_drop`，并且系统处于临界压力且空闲时，guest 才会尝试
-`drop_caches`。
+只有你显式启用 `allow_drop`，并且达到 Critical 压力、同时 Linux guest 的 CPU 和内存余量
+都满足空闲门槛时，guest 才会尝试 `drop_caches`。
 
 ## 构建
 

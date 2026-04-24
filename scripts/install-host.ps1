@@ -119,6 +119,32 @@ logging:
   max_file_size_mb: 8
   max_files: 5
   max_age_days: 7
+reclamation:
+  baseline_gap: 2147483648
+  gap_ratio_mild: 0.01
+  gap_ratio_moderate: 0.03
+  gap_ratio_heavy: 0.06
+  gap_ratio_critical: 0.12
+  host_memory_warning: 0.70
+  host_memory_pressure: 0.80
+  guest_cpu_idle: 0.05
+  guest_mem_available_idle_ratio: 0.15
+  guest_io_idle: 10.0
+  reclaim_ratio_moderate: 0.20
+  reclaim_ratio_heavy: 0.50
+  reclaim_floor_ratio: 0.001
+  reclaim_cap_moderate: 0.008
+  reclaim_cap_heavy: 0.016
+  sustained_windows: 3
+  cooldown_moderate:
+    secs: 10
+    nanos: 0
+  cooldown_heavy:
+    secs: 30
+    nanos: 0
+  cooldown_critical:
+    secs: 600
+    nanos: 0
 "@ | Set-Content -Encoding utf8 -LiteralPath (Join-Path $configDir "config.yaml")
 
 if ($NoStart) {

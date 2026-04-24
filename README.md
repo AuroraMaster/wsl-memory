@@ -59,6 +59,26 @@ reclamation:
   gap_ratio_moderate: 0.03
   gap_ratio_heavy: 0.06
   gap_ratio_critical: 0.12
+  host_memory_warning: 0.70
+  host_memory_pressure: 0.80
+  guest_cpu_idle: 0.05
+  guest_mem_available_idle_ratio: 0.15
+  guest_io_idle: 10.0
+  reclaim_ratio_moderate: 0.20
+  reclaim_ratio_heavy: 0.50
+  reclaim_floor_ratio: 0.001
+  reclaim_cap_moderate: 0.008
+  reclaim_cap_heavy: 0.016
+  sustained_windows: 3
+  cooldown_moderate:
+    secs: 10
+    nanos: 0
+  cooldown_heavy:
+    secs: 30
+    nanos: 0
+  cooldown_critical:
+    secs: 600
+    nanos: 0
 ```
 
 If the file does not exist, the host creates it and writes the first available
@@ -81,6 +101,20 @@ local_reclaim:
   avail_ratio_low: 0.15
   cpu_idle: 5.0
   io_idle: 10.0
+  reclaim_fraction_moderate: 0.10
+  reclaim_fraction_heavy: 0.25
+  reclaim_floor_ratio: 0.002
+  reclaim_cap_ratio: 0.010
+  sustained_ticks: 3
+  cooldown:
+    secs: 15
+    nanos: 0
+  host_defer:
+    secs: 30
+    nanos: 0
+  check_interval:
+    secs: 5
+    nanos: 0
 ```
 
 `host` can be `auto:multi` for gateway discovery plus recommended-port probing,
@@ -95,9 +129,15 @@ Network-shaping fields (`listen_ip`, `listen_port`, `listen_addr`, `host`,
 `multi_path`, `tcp`) require a service restart or reconnect because they affect
 bound sockets and target selection.
 
-The host-side `reclamation` section tunes the adaptive scoring thresholds. The
-guest-side `local_reclaim` section tunes the offline fallback reclaimer. These
-sections are read on startup, so restart the corresponding service after
+The host-side `reclamation` section tunes the adaptive scoring thresholds and
+the Critical `drop_caches` idle gate. `guest_cpu_idle` uses the Linux guest CPU
+reported from `/proc/stat`; `guest_mem_available_idle_ratio` uses
+`MemAvailable / MemTotal` from the guest `/proc/meminfo`. `guest_io_idle` is
+kept for compatibility with older config files but no longer gates Critical
+`drop_caches`.
+
+The guest-side `local_reclaim` section tunes the offline fallback reclaimer.
+These sections are read on startup, so restart the corresponding service after
 editing them.
 
 Host service logs now rotate by size and age using the `logging` section.
@@ -105,8 +145,9 @@ Guest logs still go to `journald`, with service-level rate limiting enabled in
 the installed unit.
 
 `allow_drop` is disabled by default. The guest prefers cgroup v2
-`memory.reclaim`; `drop_caches` is only used when explicitly enabled and when
-the agent sees critical idle pressure.
+`memory.reclaim`; `drop_caches` is only used when explicitly enabled, Critical
+pressure is reached, and the guest is quiet by Linux CPU plus Linux memory
+headroom.
 
 ## Build
 
