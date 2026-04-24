@@ -21,6 +21,10 @@ pub struct SystemMetrics {
 
     pub guest_resident: u64,
     pub guest_file_cache: u64,
+    /// Guest `MemTotal` from `/proc/meminfo` (bytes).
+    pub guest_mem_total: u64,
+    /// Guest `MemAvailable` from `/proc/meminfo` (bytes); 0 if absent.
+    pub guest_mem_available: u64,
     pub guest_cpu_percent: f32,
     pub guest_io_rate: f32,
 
@@ -33,6 +37,10 @@ pub struct SystemMetrics {
 /// The one absolute value is `baseline_gap` — the inherent overhead of
 /// WSL2/Hyper-V that should never be reclaimed (idle Debian ~1.2 GB in
 /// guest ↔ 3-4 GB vmmem ⇒ ~2 GB baseline).
+fn default_guest_mem_available_idle_ratio() -> f32 {
+    0.15
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReclamationConfig {
@@ -51,9 +59,14 @@ pub struct ReclamationConfig {
     pub host_memory_warning: f32,  // 0.70
     pub host_memory_pressure: f32, // 0.80
 
-    // ----- guest idle detection -----
+    // ----- guest "idle" for disruptive ops (e.g. drop_caches on Critical) -----
+    /// Max guest CPU utilisation (0–1) to treat the VM as idle enough.
     pub guest_cpu_idle: f32, // 0.05  (5 %)
-    pub guest_io_idle: f32,  // 10.0  MB/s
+    /// Minimum `MemAvailable` / `MemTotal` inside the guest (0–1).
+    #[serde(default = "default_guest_mem_available_idle_ratio")]
+    pub guest_mem_available_idle_ratio: f32,
+    /// Unused: kept for backward-compatible YAML; idle gating no longer reads IO.
+    pub guest_io_idle: f32,
 
     // ----- reclaim sizing (all fractions of host_memory_total) -----
     pub reclaim_ratio_moderate: f32, // 0.20 of effective gap
@@ -83,6 +96,7 @@ impl Default for ReclamationConfig {
             host_memory_pressure: 0.80,
 
             guest_cpu_idle: 0.05,
+            guest_mem_available_idle_ratio: default_guest_mem_available_idle_ratio(),
             guest_io_idle: 10.0,
 
             reclaim_ratio_moderate: 0.20,
@@ -291,10 +305,24 @@ impl ElasticReclaimer {
         level
     }
 
+    /// Whether the guest is "quiet" enough for disruptive ops (`drop_caches`):
+    /// low CPU plus sufficient **Linux-reported** memory headroom (`MemAvailable`),
+    /// not disk IO throughput.
     pub fn is_system_idle(&self) -> bool {
         self.metrics_history.back().is_some_and(|m| {
-            m.guest_cpu_percent < self.config.guest_cpu_idle
-                && m.guest_io_rate < self.config.guest_io_idle
+            let cpu_ok = m.guest_cpu_percent < self.config.guest_cpu_idle;
+            let mem_ok = if m.guest_mem_total == 0 {
+                // Legacy metrics payload without mem fields — do not block on memory gate.
+                true
+            } else if m.guest_mem_available > 0 {
+                (m.guest_mem_available as f64 / m.guest_mem_total as f64)
+                    >= self.config.guest_mem_available_idle_ratio as f64
+            } else {
+                let headroom = m.guest_mem_total.saturating_sub(m.guest_resident) as f64
+                    / m.guest_mem_total as f64;
+                headroom >= self.config.guest_mem_available_idle_ratio as f64
+            };
+            cpu_ok && mem_ok
         })
     }
 
@@ -354,9 +382,8 @@ impl ElasticReclaimer {
                     self.last_critical_time = Some(now);
                     ReclamationAction::DropCaches { level: 3 }
                 } else {
-                    // System busy under Critical pressure: use Heavy-tier
-                    // actions (Compact / GradualReclaim) until idle.
-                    // DropCaches intentionally skipped when system is busy.
+                    // Guest CPU high or Linux memory headroom low under Critical:
+                    // use Heavy-tier actions instead of `drop_caches`.
                     self.fallback_heavy(now)
                 }
             }
@@ -665,6 +692,30 @@ mod tests {
         guest_cpu: f32,
         guest_io: f32,
     ) -> SystemMetrics {
+        make_metrics_with_guest_mem(
+            host_gb,
+            gap_gb,
+            host_used_pct,
+            wslconfig_gb,
+            cache_pct,
+            guest_cpu,
+            guest_io,
+            16 * GB,
+            8 * GB,
+        )
+    }
+
+    fn make_metrics_with_guest_mem(
+        host_gb: f64,
+        gap_gb: f64,
+        host_used_pct: f64,
+        wslconfig_gb: Option<f64>,
+        cache_pct: f64,
+        guest_cpu: f32,
+        guest_io: f32,
+        guest_mem_total: u64,
+        guest_mem_available: u64,
+    ) -> SystemMetrics {
         let host_total = (host_gb * GB as f64) as u64;
         let host_avail = ((1.0 - host_used_pct / 100.0) * host_total as f64) as u64;
         let guest_resident: u64 = 8 * GB;
@@ -678,6 +729,8 @@ mod tests {
             wslconfig_memory_limit: wslconfig_gb.map(|g| (g * GB as f64) as u64),
             guest_resident,
             guest_file_cache,
+            guest_mem_total,
+            guest_mem_available,
             guest_cpu_percent: guest_cpu,
             guest_io_rate: guest_io,
             gap: (gap_gb * GB as f64) as u64,
@@ -818,6 +871,49 @@ mod tests {
     fn test_default_baseline_exists() {
         let cfg = ReclamationConfig::default();
         assert_eq!(cfg.baseline_gap, 2 * GB);
+    }
+
+    #[test]
+    fn test_is_system_idle_ignores_io() {
+        let mut r = ElasticReclaimer::new(ReclamationConfig::default());
+        r.push_metrics(make_metrics(
+            32.0,
+            8.0,
+            96.0,
+            Some(12.0),
+            92.0,
+            0.01,
+            99999.0,
+        ));
+        assert!(
+            r.is_system_idle(),
+            "extreme IO must not block idle (CPU+MemAvailable gate only)"
+        );
+    }
+
+    #[test]
+    fn test_is_system_idle_false_when_cpu_high() {
+        let mut r = ElasticReclaimer::new(ReclamationConfig::default());
+        r.push_metrics(make_metrics(32.0, 8.0, 96.0, Some(12.0), 92.0, 0.5, 0.0));
+        assert!(!r.is_system_idle());
+    }
+
+    #[test]
+    fn test_is_system_idle_false_when_guest_mem_tight() {
+        let mut r = ElasticReclaimer::new(ReclamationConfig::default());
+        // 1 GiB / 16 GiB ≈ 6 % available < default 15 % threshold
+        r.push_metrics(make_metrics_with_guest_mem(
+            32.0,
+            8.0,
+            96.0,
+            Some(12.0),
+            92.0,
+            0.01,
+            0.0,
+            16 * GB,
+            1 * GB,
+        ));
+        assert!(!r.is_system_idle());
     }
 
     // ---------------------------------------------------------------

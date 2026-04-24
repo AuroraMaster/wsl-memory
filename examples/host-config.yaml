@@ -19,6 +19,8 @@ reclamation:
   host_memory_warning: 0.70
   host_memory_pressure: 0.80
   guest_cpu_idle: 0.05
+  # MemAvailable/MemTotal in the guest must be at least this for Critical `drop_caches`.
+  guest_mem_available_idle_ratio: 0.15
   guest_io_idle: 10.0
   reclaim_ratio_moderate: 0.20
   reclaim_ratio_heavy: 0.50

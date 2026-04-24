@@ -398,6 +398,8 @@ struct MetricsMsg<'a> {
     distro: &'a str,
     resident: u64,
     file_cache: u64,
+    mem_total: u64,
+    mem_available: u64,
     anon: u64,
     cpu_percent: f32,
     io_rate: f32,
@@ -429,9 +431,10 @@ struct ResultMsg<'a> {
 // Metrics collection
 // ---------------------------------------------------------------------------
 
-fn parse_meminfo() -> std::io::Result<(u64, u64, u64)> {
+fn parse_meminfo() -> std::io::Result<(u64, u64, u64, u64, u64)> {
     let s = fs::read_to_string("/proc/meminfo")?;
     let mut total = 0u64;
+    let mut available = 0u64;
     let mut cached = 0u64;
     let mut s_reclaim = 0u64;
     let mut buffers = 0u64;
@@ -445,6 +448,7 @@ fn parse_meminfo() -> std::io::Result<(u64, u64, u64)> {
         let val = parts[1].parse::<u64>().unwrap_or(0) * 1024;
         match parts[0] {
             "MemTotal:" => total = val,
+            "MemAvailable:" => available = val,
             "Cached:" => cached = val,
             "SReclaimable:" => s_reclaim = val,
             "Buffers:" => buffers = val,
@@ -456,7 +460,14 @@ fn parse_meminfo() -> std::io::Result<(u64, u64, u64)> {
     let file_cache = cached + s_reclaim + buffers;
     let resident = total.saturating_sub(free);
     let anon = resident.saturating_sub(file_cache);
-    Ok((resident, file_cache, anon))
+    if available == 0 && total > 0 {
+        // Very old kernels: no MemAvailable line — rough headroom for host-side heuristics.
+        available = free.saturating_add(file_cache);
+        if available > total {
+            available = total;
+        }
+    }
+    Ok((resident, file_cache, anon, total, available))
 }
 
 /// Cross-tick CPU sampler — no blocking sleep.  Uses the natural tick
@@ -673,7 +684,7 @@ fn caps() -> &'static ReclaimCapabilities {
 
 async fn execute_reclaim(bytes: u64) -> Result<u64, String> {
     info!("executing reclaim: {} bytes", bytes);
-    let before_cache = parse_meminfo().ok().map(|(_, c, _)| c).unwrap_or(0);
+    let before_cache = parse_meminfo().ok().map(|(_, c, _, _, _)| c).unwrap_or(0);
 
     if caps().memory_reclaim.is_empty() {
         warn!("memory.reclaim unavailable (needs cgroup v2 + kernel >= 5.19)");
@@ -683,7 +694,7 @@ async fn execute_reclaim(bytes: u64) -> Result<u64, String> {
         match fs::write(path, bytes.to_string()) {
             Ok(()) => {
                 sleep(Duration::from_secs(2)).await;
-                let after = parse_meminfo().ok().map(|(_, c, _)| c).unwrap_or(0);
+                let after = parse_meminfo().ok().map(|(_, c, _, _, _)| c).unwrap_or(0);
                 let freed = before_cache.saturating_sub(after);
                 info!("reclaim via {} freed ~{} bytes", path, freed);
                 return Ok(freed);
@@ -698,7 +709,7 @@ async fn execute_reclaim(bytes: u64) -> Result<u64, String> {
         info!("falling back to compact_memory");
         let _ = fs::write("/proc/sys/vm/compact_memory", "1");
         sleep(Duration::from_secs(2)).await;
-        let after = parse_meminfo().ok().map(|(_, c, _)| c).unwrap_or(0);
+        let after = parse_meminfo().ok().map(|(_, c, _, _, _)| c).unwrap_or(0);
         let freed = before_cache.saturating_sub(after);
         return Ok(freed);
     }
@@ -805,7 +816,7 @@ fn collect_metrics(
     cpu: &mut CpuSampler,
     io: &mut IoSampler,
 ) -> anyhow::Result<Vec<u8>> {
-    let (resident, file_cache, anon) = parse_meminfo()?;
+    let (resident, file_cache, anon, mem_total, mem_available) = parse_meminfo()?;
     let cpu_percent = cpu.sample();
     let io_rate = io.sample();
     let distro = std::env::var("WSL_DISTRO_NAME").unwrap_or_else(|_| "wsl".to_string());
@@ -816,6 +827,8 @@ fn collect_metrics(
         distro: &distro,
         resident,
         file_cache,
+        mem_total,
+        mem_available,
         anon,
         cpu_percent,
         io_rate,

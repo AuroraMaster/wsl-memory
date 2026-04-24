@@ -84,6 +84,10 @@ struct GuestMetricsMsg {
     distro: Option<String>,
     resident: u64,
     file_cache: u64,
+    #[serde(default)]
+    mem_total: u64,
+    #[serde(default)]
+    mem_available: u64,
     cpu_percent: Option<f32>,
     io_rate: Option<f32>,
 }
@@ -419,6 +423,8 @@ fn process_elastic_metrics(
         wslconfig_memory_limit: wslconfig_limit,
         guest_resident: m.resident,
         guest_file_cache: m.file_cache,
+        guest_mem_total: m.mem_total,
+        guest_mem_available: m.mem_available,
         guest_cpu_percent: m.cpu_percent.unwrap_or(0.0) / 100.0,
         guest_io_rate: m.io_rate.unwrap_or(0.0),
         gap,
