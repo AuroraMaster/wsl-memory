@@ -47,6 +47,12 @@ curl -fsSL https://github.com/AuroraMaster/wsl-memory/releases/latest/download/i
   | sudo WSL_MEMORY_TOKEN_PATH=/usr/local/etc/wsl-memory-agent/token sh
 ```
 
+默认鲁棒性行为：
+
+- Windows host 默认安装为自动启动服务，并配置 SCM 故障自动拉起。
+- WSL guest 默认安装为 `systemd` 服务，`Restart=always`。
+- 如果 WSL 先启动、Windows host 还没起来，或者共享 token 暂时不可用，guest 不会退出，会继续本地回收并持续重试共享 token / 本地 token，等 host 可用后自动恢复通信。
+
 ## 配置
 
 Windows host 配置：

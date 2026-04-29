@@ -78,7 +78,8 @@ struct Opt {
 
 #[derive(Clone)]
 struct GuestRuntimeConfig {
-    token: String,
+    token: Option<String>,
+    token_path: Option<PathBuf>,
     interval: u64,
     allow_drop: bool,
 }
@@ -152,17 +153,38 @@ impl GuestConfig {
 
 fn load_runtime_config(config_path: &Path, opt: &Opt) -> anyhow::Result<GuestRuntimeConfig> {
     let cfg = GuestConfig::load(config_path)?.merged_with_cli(opt);
-    let token = fs::read_to_string(&cfg.token_path)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| anyhow::anyhow!("failed read token at {:?}: {}", cfg.token_path, e))?;
-    if token.is_empty() {
-        anyhow::bail!("token at {:?} is empty", cfg.token_path);
-    }
+    let (token, token_path) = resolve_token(&cfg.token_path);
     Ok(GuestRuntimeConfig {
         token,
+        token_path,
         interval: cfg.interval.max(1),
         allow_drop: cfg.allow_drop,
     })
+}
+
+fn resolve_token(preferred: &Path) -> (Option<String>, Option<PathBuf>) {
+    let mut candidates = vec![preferred.to_path_buf()];
+
+    let shared = PathBuf::from("/mnt/c/Users/Public/wsl_agent_token");
+    if candidates.iter().all(|p| p != &shared) {
+        candidates.push(shared);
+    }
+
+    let local = PathBuf::from("/usr/local/etc/wsl-memory-agent/token");
+    if candidates.iter().all(|p| p != &local) {
+        candidates.push(local);
+    }
+
+    for path in candidates {
+        if let Ok(token) = fs::read_to_string(&path) {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                return (Some(token), Some(path));
+            }
+        }
+    }
+
+    (None, None)
 }
 
 fn current_runtime(runtime: &Arc<RwLock<GuestRuntimeConfig>>) -> GuestRuntimeConfig {
@@ -170,7 +192,8 @@ fn current_runtime(runtime: &Arc<RwLock<GuestRuntimeConfig>>) -> GuestRuntimeCon
         .read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| GuestRuntimeConfig {
-            token: String::new(),
+            token: None,
+            token_path: None,
             interval: 4,
             allow_drop: false,
         })
@@ -563,16 +586,31 @@ impl IoSampler {
 }
 
 fn discover_gateway_ip() -> Option<String> {
-    let out = std::process::Command::new("ip")
-        .arg("route")
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    for line in s.lines() {
-        if line.starts_with("default") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(idx) = parts.iter().position(|p| *p == "via") {
-                return parts.get(idx + 1).map(|s| s.to_string());
+    for ip_cmd in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip", "ip"] {
+        if let Ok(out) = std::process::Command::new(ip_cmd).arg("route").output() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for line in s.lines() {
+                if line.starts_with("default") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(idx) = parts.iter().position(|p| *p == "via") {
+                        return parts.get(idx + 1).map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(s) = fs::read_to_string("/proc/net/route") {
+        for line in s.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() > 2 && fields[1] == "00000000" {
+                if let Ok(raw) = u32::from_str_radix(fields[2], 16) {
+                    let bytes = raw.to_le_bytes();
+                    return Some(format!(
+                        "{}.{}.{}.{}",
+                        bytes[0], bytes[1], bytes[2], bytes[3]
+                    ));
+                }
             }
         }
     }
@@ -853,10 +891,26 @@ async fn run_tcp_loop(
     let mut cpu = CpuSampler::new();
     let mut io = IoSampler::new();
     let mut command_cache = CommandCache::new();
+    let mut token_missing_logged = false;
     let result = async {
         loop {
             let rt = current_runtime(&runtime);
-            let mut out = collect_metrics(&rt.token, &mut cpu, &mut io)?;
+            let Some(token) = rt.token.as_deref() else {
+                if !token_missing_logged {
+                    warn!(
+                        "guest token unavailable; waiting for {:?} or shared/local fallback token before sending metrics",
+                        rt.token_path
+                    );
+                    token_missing_logged = true;
+                }
+                sleep(Duration::from_secs(rt.interval)).await;
+                continue;
+            };
+            if token_missing_logged {
+                info!("guest token loaded; resuming host metrics");
+                token_missing_logged = false;
+            }
+            let mut out = collect_metrics(token, &mut cpu, &mut io)?;
             out.push(b'\n');
             write_half.write_all(&out).await?;
 
@@ -909,11 +963,27 @@ async fn run_udp_loop(
     let mut cpu = CpuSampler::new();
     let mut io = IoSampler::new();
     let mut command_cache = CommandCache::new();
+    let mut token_missing_logged = false;
 
     let result: anyhow::Result<()> = async {
         loop {
             let rt = current_runtime(&runtime);
-            let out = collect_metrics(&rt.token, &mut cpu, &mut io)?;
+            let Some(token) = rt.token.as_deref() else {
+                if !token_missing_logged {
+                    warn!(
+                        "guest token unavailable; waiting for {:?} or shared/local fallback token before sending metrics",
+                        rt.token_path
+                    );
+                    token_missing_logged = true;
+                }
+                sleep(Duration::from_secs(rt.interval)).await;
+                continue;
+            };
+            if token_missing_logged {
+                info!("guest token loaded; resuming host metrics");
+                token_missing_logged = false;
+            }
+            let out = collect_metrics(token, &mut cpu, &mut io)?;
             sock.send(&out).await?;
 
             match tokio::time::timeout(Duration::from_secs(1), sock.recv(&mut buf)).await {
@@ -1072,6 +1142,12 @@ async fn main() -> anyhow::Result<()> {
         error!("{}", e);
         std::process::exit(1);
     });
+
+    if runtime_initial.token.is_none() {
+        warn!(
+            "no guest token found yet; service will stay alive and keep retrying shared/local token paths"
+        );
+    }
 
     if runtime_initial.allow_drop {
         warn!("drop_caches is ENABLED (may impact performance)");
@@ -1232,5 +1308,92 @@ fn resolve_host_addr(host_arg: &str) -> anyhow::Result<String> {
         }
     } else {
         Ok(host_arg.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_runtime_config, Opt};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time ok")
+            .as_nanos();
+        std::env::temp_dir().join(format!("wsl-memory-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn runtime_config_tolerates_missing_token() {
+        let config_path = temp_path("missing-token.yaml");
+        let token_path = temp_path("missing-token.txt");
+        let yaml = format!(
+            "host: 127.0.0.1:15555\ntoken_path: {}\ninterval: 4\nallow_drop: false\nmulti_path: true\ntcp: false\n",
+            token_path.display()
+        );
+        fs::write(&config_path, yaml).expect("write config");
+
+        let opt = Opt {
+            config: config_path.clone(),
+            host: None,
+            token_path: None,
+            interval: None,
+            allow_drop: false,
+            multi_path: false,
+            no_multi_path: false,
+            install: false,
+            uninstall: false,
+            status: false,
+            check_port: false,
+            tcp: false,
+            udp: false,
+        };
+
+        let runtime = load_runtime_config(&config_path, &opt).expect("load runtime");
+        assert!(runtime.token.is_none());
+
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn runtime_config_uses_fallback_token_path() {
+        let config_path = temp_path("fallback-token.yaml");
+        let preferred_token = temp_path("preferred-missing.txt");
+        let fallback_token = temp_path("fallback-present.txt");
+        fs::write(&fallback_token, "secret-token").expect("write fallback token");
+        let yaml = format!(
+            "host: 127.0.0.1:15555\ntoken_path: {}\ninterval: 4\nallow_drop: false\nmulti_path: true\ntcp: false\n",
+            preferred_token.display()
+        );
+        fs::write(&config_path, yaml).expect("write config");
+
+        let opt = Opt {
+            config: config_path.clone(),
+            host: None,
+            token_path: Some(fallback_token.clone()),
+            interval: None,
+            allow_drop: false,
+            multi_path: false,
+            no_multi_path: false,
+            install: false,
+            uninstall: false,
+            status: false,
+            check_port: false,
+            tcp: false,
+            udp: false,
+        };
+
+        let runtime = load_runtime_config(&config_path, &opt).expect("load runtime");
+        assert_eq!(runtime.token.as_deref(), Some("secret-token"));
+        assert_eq!(
+            runtime.token_path.as_deref(),
+            Some(fallback_token.as_path())
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(fallback_token);
     }
 }

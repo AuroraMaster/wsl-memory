@@ -35,6 +35,12 @@ The WSL installer reads it through:
 /mnt/c/Users/Public/wsl_agent_token
 ```
 
+Robust-by-default behavior:
+
+- Windows host installs as an auto-start Windows service and configures SCM recovery so crashes are restarted automatically.
+- WSL guest installs as a `systemd` service with `Restart=always`.
+- If WSL starts before the Windows host, or the shared token is not ready yet, the guest stays alive, keeps doing local reclaim, and keeps retrying shared/local token paths until host communication becomes available.
+
 ## Configuration
 
 Windows host config:

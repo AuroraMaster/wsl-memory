@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::process::Command;
 use std::time::Duration;
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
@@ -11,6 +12,8 @@ use windows_service::{define_windows_service, service_dispatcher};
 pub const SERVICE_NAME: &str = "WSLMemoryHost";
 const DISPLAY_NAME: &str = "WSL Memory Host Agent";
 const DESCRIPTION: &str = "Intelligent WSL2 vmmem memory management service";
+const RECOVERY_RESET_SECONDS: &str = "86400";
+const RECOVERY_ACTIONS: &str = "restart/5000/restart/30000/restart/60000";
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -93,6 +96,38 @@ fn run_service_inner() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn configure_service_recovery() -> anyhow::Result<()> {
+    let status = Command::new("sc.exe")
+        .args([
+            "failure",
+            SERVICE_NAME,
+            "reset=",
+            RECOVERY_RESET_SECONDS,
+            "actions=",
+            RECOVERY_ACTIONS,
+        ])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to configure service recovery: {}", status);
+    }
+
+    let status = Command::new("sc.exe")
+        .args(["failureflag", SERVICE_NAME, "1"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to enable service failure actions: {}", status);
+    }
+
+    let status = Command::new("sc.exe")
+        .args(["config", SERVICE_NAME, "start=", "delayed-auto"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to enable delayed auto-start: {}", status);
+    }
+
+    Ok(())
+}
+
 pub fn install() -> anyhow::Result<()> {
     let exe_path = std::env::current_exe()?;
     let config = super::config::load_or_create()?;
@@ -120,6 +155,7 @@ pub fn install() -> anyhow::Result<()> {
         ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
     )?;
     service.set_description(DESCRIPTION)?;
+    configure_service_recovery()?;
     service.start::<OsString>(&[])?;
 
     if let Some(port) = config.effective_listen_port() {
