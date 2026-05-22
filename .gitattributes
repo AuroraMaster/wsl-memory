@@ -1,5 +1,27 @@
 * text=auto eol=lf
 
-*.ps1 text eol=lf
-*.sh text eol=lf
-*.service text eol=lf
+# Windows-side scripts must stay CRLF or PowerShell ISE chokes when an
+# operator opens them locally to edit. The agent itself reads them either
+# way, but humans don't.
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Unix-side: keep LF strictly
+*.sh        text eol=lf
+*.service   text eol=lf
+
+# Binaries / installer artifacts
+*.png    binary
+*.jpg    binary
+*.ico    binary
+*.deb    binary
+*.tar.gz binary
+
+# Don't expand tabs in Makefiles
+Makefile  text whitespace=tab-in-indent
+
+# Lockfiles — tracked but excluded from diff stats and rename detection
+Cargo.lock  -diff
